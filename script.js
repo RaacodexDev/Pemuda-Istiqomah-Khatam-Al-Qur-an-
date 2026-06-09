@@ -209,8 +209,41 @@ async function ensureUser(userId, name) {
 }
 
 // ============================================================
-// [4] LOGIN
+// resolveUserIdByName — atomic via runTransaction
+//
+// ALASAN pakai runTransaction (bukan getDoc+setDoc):
+//   Tanpa transaksi: dua device login nama yang sama bersamaan
+//   → keduanya getDoc → keduanya lihat "belum ada" → keduanya
+//   buat UUID berbeda → duplikasi user.
+//
+//   Dengan transaksi: Firestore menjamin hanya satu yang berhasil
+//   menulis. Yang kalah akan retry dan membaca dokumen yang
+//   sudah dibuat, lalu return userId yang sama.
 // ============================================================
+async function resolveUserIdByName(name) {
+  const indexRef = doc(db, "nameIndex", name);
+  let resolvedId;
+
+  await runTransaction(db, async (tx) => {
+    const indexSnap = await tx.get(indexRef);
+
+    if (indexSnap.exists()) {
+      // Nama sudah ada — pakai userId lama, jangan buat UUID baru
+      resolvedId = indexSnap.data().userId;
+    } else {
+      // Nama baru — buat UUID dan daftarkan secara atomic
+      resolvedId = generateUUID();
+      tx.set(indexRef, {
+        userId:    resolvedId,
+        createdAt: serverTimestamp(),
+      });
+    }
+  });
+
+  return resolvedId;
+}
+
+
 window.handleLogin = async function () {
   const input = document.getElementById("nameInput");
   const name  = input.value.trim();
@@ -225,13 +258,10 @@ window.handleLogin = async function () {
   btn.innerHTML = `<div class="spinner"></div><span>Memuat...</span>`;
 
   try {
-    // Ambil atau buat UUID — UUID disimpan di localStorage, bukan di nama
-    let userId = localStorage.getItem("pi_userId");
-    if (!userId) {
-      userId = generateUUID();
-      localStorage.setItem("pi_userId", userId);
-    }
-    localStorage.setItem("pi_name", name);
+    // Resolusi userId berdasarkan nama — konsisten lintas device/browser
+    const userId = await resolveUserIdByName(name);
+    localStorage.setItem("pi_userId", userId);
+    localStorage.setItem("pi_name",   name);
 
     await ensureUser(userId, name);
 
@@ -506,8 +536,9 @@ window.handleLogout = function () {
   if (!confirm("Yakin mau keluar?")) return;
   if (unsubUsers) { unsubUsers(); unsubUsers = null; }
   listenerStarted = false;
-  // PENTING: jangan hapus pi_userId dari localStorage — UUID harus persisten
-  // agar user yang sama selalu punya ID yang sama di device ini.
+  // Hapus keduanya — userId akan di-resolve ulang dari nameIndex
+  // saat login berikutnya, jadi tidak ada risiko kehilangan data.
+  localStorage.removeItem("pi_userId");
   localStorage.removeItem("pi_name");
   currentUserId = null;
   currentName   = null;
@@ -525,21 +556,34 @@ document.getElementById("nameInput").addEventListener("keydown", e => {
 // ============================================================
 // [7] AUTO-LOGIN
 //
-// UUID sudah ada di localStorage → langsung pakai.
-// Nama juga ada → skip login screen.
-// UUID ada tapi nama tidak ada → tampilkan login (bisa ganti nama).
-// Keduanya tidak ada → tampilkan login (user baru).
+// Kedua key ada di localStorage → verifikasi userId dengan
+// nameIndex (jaga konsistensi kalau localStorage pernah corrupt
+// atau user pakai device berbeda sebelumnya).
+// Jika nameIndex punya userId berbeda → pakai nameIndex sebagai
+// source of truth, update cache.
 // ============================================================
 (async function init() {
   const savedId   = localStorage.getItem("pi_userId");
   const savedName = localStorage.getItem("pi_name");
 
   if (savedId && savedName) {
-    currentUserId = savedId;
-    currentName   = savedName;
     document.getElementById("nameInput").value = savedName;
     try {
-      await ensureUser(savedId, savedName);
+      // Verifikasi: nameIndex mungkin punya userId berbeda
+      // (misal user pernah login di browser lain dulu)
+      const indexSnap = await getDoc(doc(db, "nameIndex", savedName));
+      const verifiedId = indexSnap.exists()
+        ? indexSnap.data().userId   // pakai nameIndex sebagai truth
+        : savedId;                  // nameIndex belum ada, pakai cache
+
+      // Update cache jika berbeda
+      if (verifiedId !== savedId) {
+        localStorage.setItem("pi_userId", verifiedId);
+      }
+
+      currentUserId = verifiedId;
+      currentName   = savedName;
+      await ensureUser(verifiedId, savedName);
       await enterApp();
     } catch (e) {
       console.error("[Auto-login failed]", e);
